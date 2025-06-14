@@ -42,19 +42,19 @@
 ---
 
 ## 資料集目錄結構
-data/
-├── imagenette_160/
-│ ├── train/
-│ └── val/
-├── mini_voc_seg/
-│ ├── train/
-│ └── val/
-├── mini_coco_det/
-│ ├── train/
-│ ├── val/
-│ └── annotations/
-│ ├── mini_instances_train2017.json
-│ └── mini_instances_val2017.json
+data/   
+├── imagenette_160/   
+│ ├── train/   
+│ └── val/   
+├── mini_voc_seg/   
+│ ├── train/   
+│ └── val/   
+├── mini_coco_det/   
+│ ├── train/   
+│ ├── val/   
+│ └── annotations/   
+│ ├── mini_instances_train2017.json   
+│ └── mini_instances_val2017.json   
 ## 執行後將自動完成以下流程：
 
  - 建立三種 DataLoader（Seg, Det, Cls）
