@@ -39,11 +39,11 @@ set_seed(42)  # or any other fixed number
 
 # --- 全域配置 ---
 IMAGE_SIZE = (512, 512) 
-BATCH_SIZE = 8 
+BATCH_SIZE = 16
 LEARNING_RATE = 1e-4
-NUM_EPOCHS_STAGE1 = 25 # Segmentation
-NUM_EPOCHS_STAGE2 = 25 # Detection
-NUM_EPOCHS_STAGE3 = 25# Classification
+NUM_EPOCHS_STAGE1 = 15 # Segmentation
+NUM_EPOCHS_STAGE2 = 15 # Detection
+NUM_EPOCHS_STAGE3 = 15# Classification
 
 # Forgetting Mitigation Toolbox 
 USE_LWF = False # Learning without Forgetting
