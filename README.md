@@ -67,15 +67,15 @@ data/
 
  - 評估是否符合「性能下降 ≤ 5%」的作業要求
 ## 結果範例
-Stage1 best mIoU: 0.6548
-Stage2 best mAP@50: 0.5123
-Stage3 best Top1 Acc: 0.7812
+Stage1 best mIoU: 0.6548   
+Stage2 best mAP@50: 0.5123   
+Stage3 best Top1 Acc: 0.7812   
 
-→ Final Seg mIoU: 0.6412, Det mAP@50: 0.5057, Cls Acc: 0.7710
-✔ 最終模型評估（計算是否低於 base - 5%）
+→ Final Seg mIoU: 0.6412, Det mAP@50: 0.5057, Cls Acc: 0.7710   
+✔ 最終模型評估（計算是否低於 base - 5%）   
 
-Seg mIoU: baseline=0.6548, final=0.6412, drop=0.0136 → ✅ PASS
-Det mAP@50: baseline=0.5123, final=0.5057, drop=0.0066 → ✅ PASS
-Cls Top1 Acc: baseline=0.7812, final=0.7710, drop=0.0102 → ✅ PASS
+Seg mIoU: baseline=0.6548, final=0.6412, drop=0.0136 → ✅ PASS   
+Det mAP@50: baseline=0.5123, final=0.5057, drop=0.0066 → ✅ PASS   
+Cls Top1 Acc: baseline=0.7812, final=0.7710, drop=0.0102 → ✅ PASS   
 
-🎉 所有任務性能下降皆在 5% 以內，符合需求！
+🎉 所有任務性能下降皆在 5% 以內，符合需求！   
