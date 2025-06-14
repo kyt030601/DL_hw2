@@ -41,9 +41,9 @@ set_seed(42)  # or any other fixed number
 IMAGE_SIZE = (512, 512) 
 BATCH_SIZE = 16
 LEARNING_RATE = 1e-4
-NUM_EPOCHS_STAGE1 = 15 # Segmentation
-NUM_EPOCHS_STAGE2 = 15 # Detection
-NUM_EPOCHS_STAGE3 = 15# Classification
+NUM_EPOCHS_STAGE1 = 20 # Segmentation
+NUM_EPOCHS_STAGE2 = 20 # Detection
+NUM_EPOCHS_STAGE3 = 20# Classification
 
 # Forgetting Mitigation Toolbox 
 USE_LWF = False # Learning without Forgetting
@@ -313,7 +313,89 @@ class VOCSegmentationDataset(Dataset):
         return image, mask
 
 
+class COCODetectionDataset1(Dataset):
+    def __init__(self, root_dir, annotation_file, transform=None, target_size=(512, 512), num_classes=10):
 
+        self.root_dir = Path(root_dir)
+        self.annotation_file = annotation_file
+        self.transform = transform if transform else transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        self.target_size = target_size
+        self.num_classes = num_classes
+
+        with open(annotation_file, 'r') as f:
+            self.coco = json.load(f)
+
+        self.image_ids = [img['id'] for img in self.coco['images']]
+        self.images_info = {img['id']: img for img in self.coco['images']}
+
+        # 保留前 num_classes 個類別
+        coco_categories = sorted({ann['category_id'] for ann in self.coco['annotations']})
+        selected_categories = coco_categories[:self.num_classes]
+        self.cat_id_to_class_idx = {cat_id: i for i, cat_id in enumerate(selected_categories)}
+
+        # Group annotations by image_id
+        self.img_to_annotations = {}
+        for ann in self.coco['annotations']:
+            image_id = ann['image_id']
+            if ann['category_id'] not in self.cat_id_to_class_idx:
+                continue  # 忽略非前 num_classes 類別
+            if image_id not in self.img_to_annotations:
+                self.img_to_annotations[image_id] = []
+            self.img_to_annotations[image_id].append(ann)
+
+    def __len__(self):
+        return len(self.image_ids)
+
+    def __getitem__(self, idx):
+        img_id = self.image_ids[idx]
+        img_info = self.images_info[img_id]
+        img_path = self.root_dir / img_info['file_name']
+        image = Image.open(img_path).convert("RGB")
+        original_width, original_height = image.size
+        image, _ = resize_image_mask(image, size=self.target_size)
+
+        if self.transform:
+            image = self.transform(image)
+
+        anns = self.img_to_annotations.get(img_id, [])
+        boxes, labels = [], []
+
+        scale_x = self.target_size[0] / original_width
+        scale_y = self.target_size[1] / original_height
+
+        for ann in anns:
+            cat_id = ann['category_id']
+            if cat_id not in self.cat_id_to_class_idx:
+                continue
+            label = self.cat_id_to_class_idx[cat_id]
+
+            x, y, w, h = ann['bbox']
+
+            #x_scaled = x * scale_x
+            #y_scaled = y * scale_y
+            #w_scaled = w * scale_x
+            #h_scaled = h * scale_y
+            x1 = x * scale_x
+            y1 = y * scale_y
+            x2 = (x + w) * scale_x
+            y2 = (y + h) * scale_y
+
+            boxes.append([x1, y1, x2, y2])
+            #boxes.append([x_scaled, y_scaled, w_scaled, h_scaled])
+            labels.append(label)
+
+        if not boxes:
+            boxes = torch.zeros((0, 4), dtype=torch.float32)
+            labels = torch.zeros((0,), dtype=torch.long)
+        else:
+            boxes = torch.tensor(boxes, dtype=torch.float32)
+            labels = torch.tensor(labels, dtype=torch.long)
+
+        target = {'boxes': boxes, 'labels': labels, 'image_id': torch.tensor([img_id])}
+        return image, target
 
 class COCODetectionDataset(Dataset):
     def __init__(self, root_dir, annotation_file, transform=None, target_size=(512, 512), num_classes=10):
@@ -397,7 +479,10 @@ class COCODetectionDataset(Dataset):
         }
         return image, target
 
-
+# Custom Collate Function for Detection (Simplified)
+# For detection, targets often have variable lengths, so a custom collate_fn is needed.
+# This is a very basic collate function. For actual training, you would need
+# to implement anchor matching, target encoding, etc.
 def detection_collate_fn(batch):
     images = []
     targets = []
@@ -421,7 +506,7 @@ import torch
 USE_LWF = False                     # Learning without Forgetting
 USE_REPLAY_BUFFER = True
 REPLAY_BUFFER_SIZE_PER_TASK = 20 * BATCH_SIZE  # Replay buffer 最大容量
-REPLAY_SAMPLES_PER_BATCH = 20     # 每次從 replay buffer 中抽樣的數量
+REPLAY_SAMPLES_PER_BATCH = 10     # 每次從 replay buffer 中抽樣的數量
 DETECTION_OUTPUT_CHANNELS = 5 + NUM_DET_CLASSES
 def decode_yolo_predictions1(pred_tensor, conf_thresh=0.5, image_size=512):
     """
@@ -674,12 +759,7 @@ YOLO_LOSS = YOLOLoss()
 
 def det_criterion(preds, targets):
     return YOLO_LOSS(preds, targets)
-#det_criterion = YOLOLoss(S= IMAGE_SIZE[0]//16, num_classes=NUM_DET_CLASSES)
-#def det_criterion(preds, targets):
-    # preds: (B, DET_OUTPUT_CHANNELS, H, W)
-    # targets: 不用，直接返回 0
- #   return preds.sum() * 0.0
-# --- YOLO-style Loss Function (Simplified) ---
+
 
 
 from torchmetrics import JaccardIndex
@@ -732,36 +812,34 @@ stage3_maps = []
 stage3_accs = []
 
 def plot_training_curves():
-    fig, axes = plt.subplots(3, 1, figsize=(8, 12))
+    #fig, axes = plt.subplots(3, 1, figsize=(8, 12))
 
-    # mIoU 曲線
-    axes[0].plot(stage1_mious, label="Stage1: mIoU", marker='o')
-    axes[0].plot([None]*len(stage1_mious) + stage2_mious, label="Stage2: mIoU", marker='o')
-    axes[0].plot([None]*(len(stage1_mious)+len(stage2_mious)) + stage3_mious, label="Stage3: mIoU", marker='o')
-    axes[0].set_title("Segmentation mIoU")
-    axes[0].set_xlabel("Epoch")
-    axes[0].set_ylabel("mIoU")
-    axes[0].legend()
-    axes[0].grid(True)
+    plt.figure(figsize=(6, 4))
+    plt.plot(stage1_mious, marker='o')
+    plt.title("Stage1: Segmentation mIoU")
+    plt.xlabel("Epoch")
+    plt.ylabel("mIoU")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
 
-    # mAP@50 曲線
-    total_offset = len(stage1_mious)
-    axes[1].plot([None]*total_offset + stage2_maps, label="Stage2: mAP@50", marker='o')
-    axes[1].plot([None]*(total_offset + len(stage2_maps)) + stage3_maps, label="Stage3: mAP@50", marker='o')
-    axes[1].set_title("Detection mAP@50")
-    axes[1].set_xlabel("Epoch")
-    axes[1].set_ylabel("mAP@50")
-    axes[1].legend()
-    axes[1].grid(True)
+    # Stage2: Detection mAP@50
+    plt.figure(figsize=(6, 4))
+    plt.plot(stage2_maps, marker='o')
+    plt.title("Stage2: Detection mAP@50")
+    plt.xlabel("Epoch")
+    plt.ylabel("mAP@50")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
 
-    # Top-1 Accuracy 曲線
-    axes[2].plot(stage3_accs, label="Stage3: Top-1 Acc", marker='o')
-    axes[2].set_title("Classification Top-1 Accuracy")
-    axes[2].set_xlabel("Epoch")
-    axes[2].set_ylabel("Accuracy")
-    axes[2].legend()
-    axes[2].grid(True)
-
+    # Stage3: Classification Accuracy
+    plt.figure(figsize=(6, 4))
+    plt.plot(stage3_accs, marker='o')
+    plt.title("Stage3: Classification Top-1 Accuracy")
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy")
+    plt.grid(True)
     plt.tight_layout()
     plt.show()
 # 5. 評估函式
