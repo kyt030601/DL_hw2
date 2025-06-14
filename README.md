@@ -20,9 +20,9 @@
 
 ---
 
-## 模型架構圖
+## 模型架構
 
-![Model + Training Flow](https://i.imgur.com/KlR2BeK.png)
+單一輸入 → Fast-SCNN 編碼器 → Neck → Unified Head，Head 經通道切分為三路輸出，並支援 Replay Buffer 訓練策略。
 
 ---
 
