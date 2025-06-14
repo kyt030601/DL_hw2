@@ -26,7 +26,7 @@
 
 ---
 
-## 🔧 訓練流程說明
+##  訓練流程說明
 
 1. **Stage 1：Segmentation 訓練**
    - 更新 segmentation head，儲存 replay buffer
