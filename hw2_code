@@ -1,0 +1,1130 @@
+
+import os
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
+from torchvision import transforms
+from PIL import Image
+import json
+from pathlib import Path
+from tqdm import tqdm
+import numpy as np
+import random
+from collections import deque
+import urllib.request
+import tarfile
+import zipfile
+import time # For inference speed measurement
+
+# 確保 CUDA 可用
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {DEVICE}")
+
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)  # for single-GPU
+    torch.cuda.manual_seed_all(seed)  # for multi-GPU
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed(42)  # or any other fixed number
+
+# --- 全域配置 ---
+IMAGE_SIZE = (512, 512) 
+BATCH_SIZE = 8 
+LEARNING_RATE = 1e-4
+NUM_EPOCHS_STAGE1 = 25 # Segmentation
+NUM_EPOCHS_STAGE2 = 25 # Detection
+NUM_EPOCHS_STAGE3 = 25# Classification
+
+# Forgetting Mitigation Toolbox 
+USE_LWF = False # Learning without Forgetting
+USE_REPLAY_BUFFER = True
+REPLAY_BUFFER_SIZE_PER_TASK = 10 * BATCH_SIZE # Replay buffer 最大容量，每個任務最多 BATCH_SIZE 張圖像
+
+
+BASE_DATA_DIR = Path("./data")
+IMAGENETTE_TRAIN_DIR = BASE_DATA_DIR / "imagenette_160/train"
+IMAGENETTE_VAL_DIR = BASE_DATA_DIR / "imagenette_160/val"
+VOC_TRAIN_DIR = BASE_DATA_DIR / "mini_voc_seg/train"
+VOC_VAL_DIR = BASE_DATA_DIR / "mini_voc_seg/val"
+COCO_TRAIN_DIR = BASE_DATA_DIR / "mini_coco_det/train"
+COCO_VAL_DIR = BASE_DATA_DIR / "mini_coco_det/val"
+COCO_TRAIN_ANN = BASE_DATA_DIR / "mini_coco_det/annotations/mini_instances_train2017.json"
+COCO_VAL_ANN = BASE_DATA_DIR / "mini_coco_det/annotations/mini_instances_val2017.json"
+NUM_DET_CLASSES = 10 
+NUM_SEG_CLASSES = 21 
+NUM_CLS_CLASSES = 10  
+BACKBONE_OUT_CHANNELS = 256
+NECK_HIDDEN_CHANNELS = 256
+HEAD_HIDDEN_CHANNELS = 256
+
+# Detection specific parameters (YOLO-like)
+NUM_ANCHORS = 3  
+DET_PREDICTIONS_PER_ANCHOR = 4 + 1 + NUM_DET_CLASSES  # (cx, cy, w, h, conf, C_det)
+DET_OUTPUT_CHANNELS = NUM_ANCHORS * DET_PREDICTIONS_PER_ANCHOR
+
+TOTAL_HEAD_OUT_CHANNELS = DET_OUTPUT_CHANNELS + NUM_SEG_CLASSES + NUM_CLS_CLASSES
+
+common_transforms = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+# 2. 模型定義 (Fast-SCNN Backbone, 單一分支頭)
+# -----------------------------------------------------------------------------
+
+class ConvBNReLU(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, relu=True):
+        super(ConvBNReLU, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, dilation, groups, bias=False)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True) if relu else None
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        if self.relu is not None:
+            x = self.relu(x)
+        return x
+
+# Fast-SCNN's Learning to Downsample Module (Part of Backbone)
+class LearningToDownsample(nn.Module):
+    def __init__(self, in_channels=3, base_channels=32):
+        super(LearningToDownsample, self).__init__()
+        self.conv1 = ConvBNReLU(in_channels, base_channels, 3, 2, 1) # Output e.g., 256x256x32 (stride 2)
+        # Depthwise Separable Conv for residual
+        self.res_conv1 = ConvBNReLU(base_channels, base_channels, 3, 1, 1, groups=base_channels, relu=False)
+
+        self.conv2 = ConvBNReLU(base_channels, base_channels * 2, 3, 2, 1) # Output e.g., 128x128x64 (stride 4)
+        self.res_conv2 = ConvBNReLU(base_channels * 2, base_channels * 2, 3, 1, 1, groups=base_channels * 2, relu=False)
+
+        self.conv3 = ConvBNReLU(base_channels * 2, base_channels * 4, 3, 2, 1) # Output e.g., 64x64x128 (stride 8)
+        self.res_conv3 = ConvBNReLU(base_channels * 4, base_channels * 4, 3, 1, 1, groups=base_channels * 4, relu=False)
+
+        self.output_channels = base_channels * 4 # 128
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = x + self.res_conv1(x)
+        x = self.conv2(x)
+        x = x + self.res_conv2(x)
+        x = self.conv3(x)
+        x = x + self.res_conv3(x)
+        return x # Output feature map with stride 8
+
+# Fast-SCNN's Global Feature Extractor Module (Part of Backbone)
+class GlobalFeatureExtractor(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(GlobalFeatureExtractor, self).__init__()
+        self.bottleneck = ConvBNReLU(in_channels, out_channels, 1, 1, 0)
+
+        # Pyramid Pooling Module
+        self.pool1 = nn.AdaptiveAvgPool2d(1)
+        self.pool2 = nn.AdaptiveAvgPool2d(2)
+        self.pool3 = nn.AdaptiveAvgPool2d(3)
+        self.pool4 = nn.AdaptiveAvgPool2d(6)
+
+        self.conv_pool1 = ConvBNReLU(out_channels, out_channels // 4, 1, 1, 0)
+        self.conv_pool2 = ConvBNReLU(out_channels, out_channels // 4, 1, 1, 0)
+        self.conv_pool3 = ConvBNReLU(out_channels, out_channels // 4, 1, 1, 0)
+        self.conv_pool4 = ConvBNReLU(out_channels, out_channels // 4, 1, 1, 0)
+
+        self.conv_cat = ConvBNReLU(out_channels * 2, out_channels, 1, 1, 0)
+
+    def forward(self, x):
+        input_size = x.size()[2:] # H, W from LearningToDownsample output (e.g., 64, 64)
+        x = self.bottleneck(x)
+
+        p1 = F.interpolate(self.conv_pool1(self.pool1(x)), size=input_size, mode='bilinear', align_corners=True)
+        p2 = F.interpolate(self.conv_pool2(self.pool2(x)), size=input_size, mode='bilinear', align_corners=True)
+        p3 = F.interpolate(self.conv_pool3(self.pool3(x)), size=input_size, mode='bilinear', align_corners=True)
+        p4 = F.interpolate(self.conv_pool4(self.pool4(x)), size=input_size, mode='bilinear', align_corners=True)
+
+        x = torch.cat([x, p1, p2, p3, p4], dim=1)
+        x = self.conv_cat(x)
+
+        # Downsample from stride 8 to stride 16
+        x = F.max_pool2d(x, kernel_size=2, stride=2) # Output e.g., 32x32x256 (stride 16)
+        return x
+
+# Backbone: Fast-SCNN Encoder
+class FastSCNNBackbone(nn.Module):
+    def __init__(self, in_channels=3):
+        super(FastSCNNBackbone, self).__init__()
+        self.learning_to_downsample = LearningToDownsample(in_channels, base_channels=32)
+        self.global_feature_extractor = GlobalFeatureExtractor(
+            self.learning_to_downsample.output_channels,
+            BACKBONE_OUT_CHANNELS
+        )
+
+    def forward(self, x):
+        x_ltd = self.learning_to_downsample(x) # e.g., (B, 128, H/8, W/8)
+        x_gfe = self.global_feature_extractor(x_ltd) # e.g., (B, 256, H/16, W/16)
+        return x_gfe
+
+# Unified One-Head Multi-Task Model
+class UnifiedMultiTaskModel(nn.Module):
+    def __init__(self, num_det_classes=10, num_seg_classes=21, num_cls_classes=10):
+        super(UnifiedMultiTaskModel, self).__init__()
+
+        self.num_det_classes = num_det_classes
+        self.num_seg_classes = num_seg_classes
+        self.num_cls_classes = num_cls_classes
+
+        self.det_out_channels = 5 + num_det_classes
+        self.total_out_channels = self.det_out_channels + num_seg_classes + num_cls_classes
+
+        # Backbone (Fast-SCNN)
+        self.backbone = FastSCNNBackbone()
+
+        # Neck
+        self.neck = nn.Sequential(
+            ConvBNReLU(BACKBONE_OUT_CHANNELS, NECK_HIDDEN_CHANNELS, 3, 1, 1),
+            ConvBNReLU(NECK_HIDDEN_CHANNELS, NECK_HIDDEN_CHANNELS, 3, 1, 1)
+        )
+
+        # Head
+        self.head = nn.Sequential(
+            ConvBNReLU(NECK_HIDDEN_CHANNELS, HEAD_HIDDEN_CHANNELS, 3, 1, 1),
+            ConvBNReLU(HEAD_HIDDEN_CHANNELS, HEAD_HIDDEN_CHANNELS, 3, 1, 1),
+            nn.Conv2d(HEAD_HIDDEN_CHANNELS, self.total_out_channels, 1, 1, 0)
+        )
+
+    def forward(self, x):
+        features = self.backbone(x)
+        features = self.neck(features)
+        raw_output = self.head(features)  # (B, total_out_channels, H/16, W/16)
+
+        # Channel slicing
+        det_out = raw_output[:, :self.det_out_channels, :, :]
+        seg_out = raw_output[:, self.det_out_channels : self.det_out_channels + self.num_seg_classes, :, :]
+        cls_out_spatial = raw_output[:, self.det_out_channels + self.num_seg_classes :, :, :]
+
+        cls_logits = F.adaptive_avg_pool2d(cls_out_spatial, (1, 1)).squeeze(-1).squeeze(-1)
+
+        return {
+            "detection": det_out,
+            "segmentation": seg_out,
+            "classification": cls_logits
+        }
+
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+# 3. 資料集類別定義
+# -----------------------------------------------------------------------------
+
+def resize_image_mask(image, mask=None, size=(512, 512)):
+    # Resize image using LANCZOS for better quality
+    image = transforms.Resize(size, Image.LANCZOS)(image)
+    if mask is not None:
+        # Resize mask using NEAREST for class labels
+        mask = transforms.Resize(size, Image.NEAREST)(mask)
+        return image, mask
+    return image, None # Return tuple for consistency even if mask is None
+
+class ImagenetteDataset(Dataset):
+    def __init__(self, root_dir, transform=None, target_size=(512, 512)):
+        self.root_dir = Path(root_dir)
+        self.transform = transform if transform else transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        self.target_size = target_size
+        self.image_paths = []
+        self.labels = []
+        self.class_to_idx = {}
+
+        # Collect image paths and map class names to integer labels
+        # print(f"Loading Imagenette dataset from {root_dir}...") # Commented to reduce output during execution
+        for idx, class_name in enumerate(sorted(os.listdir(root_dir))):
+            class_path = self.root_dir / class_name
+            if class_path.is_dir():
+                self.class_to_idx[class_name] = idx
+                for img_name in os.listdir(class_path):
+                    if img_name.endswith(('.JPEG', '.jpg', '.png')):
+                        self.image_paths.append(class_path / img_name)
+                        self.labels.append(idx)
+        # print(f"Loaded {len(self.image_paths)} images for Imagenette.")
+
+    def __len__(self, ):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        label = self.labels[idx]
+
+        image = Image.open(img_path).convert("RGB")
+        image, _ = resize_image_mask(image, size=self.target_size) # Mask is None
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, torch.tensor(label, dtype=torch.long)
+
+
+class VOCSegmentationDataset(Dataset):
+    def __init__(self, root_dir, transform=None, target_size=(512, 512)):
+        self.root_dir = Path(root_dir)
+        self.image_dir = self.root_dir
+        self.mask_dir = self.root_dir # Masks are in the same directory as images
+        self.transform = transform if transform else transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        self.target_size = target_size
+
+        self.images = []
+        # print(f"Loading VOC Segmentation dataset from {root_dir}...")
+        for img_name in os.listdir(self.image_dir):
+            if img_name.endswith(('.jpg', '.jpeg', '.png')):
+                mask_name = Path(img_name).stem + '.png' # VOC masks are .png
+                if (self.mask_dir / mask_name).exists():
+                    self.images.append((self.image_dir / img_name, self.mask_dir / mask_name))
+        # print(f"Loaded {len(self.images)} image-mask pairs for VOC Segmentation.")
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        img_path, mask_path = self.images[idx]
+
+        image = Image.open(img_path).convert("RGB")
+        # Segmentation masks are typically single channel (PIL.Image.L)
+        mask = Image.open(mask_path).convert("L")
+
+        image, mask = resize_image_mask(image, mask, size=self.target_size)
+
+        if self.transform:
+            image = self.transform(image)
+
+        # Convert mask to tensor. VOC uses 0-20 for classes, 255 for ignore.
+        # Ensure mask is long type for CrossEntropyLoss.
+        mask = torch.from_numpy(np.array(mask)).long()
+        invalid_pixels_mask = (mask < 0) | ((mask > 20) & (mask != 255))
+        mask[invalid_pixels_mask] = 255
+        return image, mask
+
+
+class COCODetectionDataset1(Dataset):
+    def __init__(self, root_dir, annotation_file, transform=None, target_size=(512, 512), num_classes=10):
+
+        self.root_dir = Path(root_dir)
+        self.annotation_file = annotation_file
+        self.transform = transform if transform else transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        self.target_size = target_size
+        self.num_classes = num_classes
+
+        with open(annotation_file, 'r') as f:
+            self.coco = json.load(f)
+
+        self.image_ids = [img['id'] for img in self.coco['images']]
+        self.images_info = {img['id']: img for img in self.coco['images']}
+
+        # 保留前 num_classes 個類別
+        coco_categories = sorted({ann['category_id'] for ann in self.coco['annotations']})
+        selected_categories = coco_categories[:self.num_classes]
+        self.cat_id_to_class_idx = {cat_id: i for i, cat_id in enumerate(selected_categories)}
+
+        # Group annotations by image_id
+        self.img_to_annotations = {}
+        for ann in self.coco['annotations']:
+            image_id = ann['image_id']
+            if ann['category_id'] not in self.cat_id_to_class_idx:
+                continue  # 忽略非前 num_classes 類別
+            if image_id not in self.img_to_annotations:
+                self.img_to_annotations[image_id] = []
+            self.img_to_annotations[image_id].append(ann)
+
+    def __len__(self):
+        return len(self.image_ids)
+
+    def __getitem__(self, idx):
+        img_id = self.image_ids[idx]
+        img_info = self.images_info[img_id]
+        img_path = self.root_dir / img_info['file_name']
+        image = Image.open(img_path).convert("RGB")
+        original_width, original_height = image.size
+        image, _ = resize_image_mask(image, size=self.target_size)
+
+        if self.transform:
+            image = self.transform(image)
+
+        anns = self.img_to_annotations.get(img_id, [])
+        boxes, labels = [], []
+
+        scale_x = self.target_size[0] / original_width
+        scale_y = self.target_size[1] / original_height
+
+        for ann in anns:
+            cat_id = ann['category_id']
+            if cat_id not in self.cat_id_to_class_idx:
+                continue
+            label = self.cat_id_to_class_idx[cat_id]
+
+            x, y, w, h = ann['bbox']
+
+            #x_scaled = x * scale_x
+            #y_scaled = y * scale_y
+            #w_scaled = w * scale_x
+            #h_scaled = h * scale_y
+            x1 = x * scale_x
+            y1 = y * scale_y
+            x2 = (x + w) * scale_x
+            y2 = (y + h) * scale_y
+
+            boxes.append([x1, y1, x2, y2])
+            #boxes.append([x_scaled, y_scaled, w_scaled, h_scaled])
+            labels.append(label)
+
+        if not boxes:
+            boxes = torch.zeros((0, 4), dtype=torch.float32)
+            labels = torch.zeros((0,), dtype=torch.long)
+        else:
+            boxes = torch.tensor(boxes, dtype=torch.float32)
+            labels = torch.tensor(labels, dtype=torch.long)
+
+        target = {'boxes': boxes, 'labels': labels, 'image_id': torch.tensor([img_id])}
+        return image, target
+
+class COCODetectionDataset(Dataset):
+    def __init__(self, root_dir, annotation_file, transform=None, target_size=(512, 512), num_classes=10):
+        self.root_dir = Path(root_dir)
+        self.annotation_file = annotation_file
+        self.transform = transform if transform else transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        self.target_size = target_size
+        self.num_classes = num_classes
+
+
+        with open(annotation_file, 'r') as f:
+            self.coco = json.load(f)
+
+        self.image_ids = [img['id'] for img in self.coco['images']]
+        self.images_info = {img['id']: img for img in self.coco['images']}
+
+        # 前 num_classes 的標註類別 ID → 映射到 [0, num_classes-1]
+        coco_categories = sorted({ann['category_id'] for ann in self.coco['annotations']})
+        selected_categories = coco_categories[:self.num_classes]
+        self.cat_id_to_class_idx = {cat_id: idx for idx, cat_id in enumerate(selected_categories)}
+
+        # 對應 image_id 的標註整理好
+        self.img_to_annotations = {}
+        for ann in self.coco['annotations']:
+            if ann['category_id'] not in self.cat_id_to_class_idx:
+                continue
+            image_id = ann['image_id']
+            if image_id not in self.img_to_annotations:
+                self.img_to_annotations[image_id] = []
+            self.img_to_annotations[image_id].append(ann)
+
+    def __len__(self):
+        return len(self.image_ids)
+
+    def __getitem__(self, idx):
+        img_id = self.image_ids[idx]
+        img_info = self.images_info[img_id]
+        img_path = self.root_dir / img_info['file_name']
+        image = Image.open(img_path).convert("RGB")
+        original_width, original_height = image.size
+        image, _ = resize_image_mask(image, size=self.target_size)
+
+        if self.transform:
+            image = self.transform(image)
+
+        anns = self.img_to_annotations.get(img_id, [])
+        boxes, labels = [], []
+
+        scale_x = self.target_size[0] / original_width
+        scale_y = self.target_size[1] / original_height
+
+        for ann in anns:
+            cat_id = ann['category_id']
+            if cat_id not in self.cat_id_to_class_idx:
+                continue
+            label = self.cat_id_to_class_idx[cat_id]
+
+            x, y, w, h = ann['bbox']
+            x1 = x * scale_x
+            y1 = y * scale_y
+            x2 = (x + w) * scale_x
+            y2 = (y + h) * scale_y
+
+            boxes.append([x1, y1, x2, y2])
+            labels.append(label)
+
+        if not boxes:
+            boxes = torch.zeros((0, 4), dtype=torch.float32)
+            labels = torch.zeros((0,), dtype=torch.long)
+        else:
+            boxes = torch.tensor(boxes, dtype=torch.float32)
+            labels = torch.tensor(labels, dtype=torch.long)
+
+        target = {
+            'boxes': boxes,
+            'labels': labels,
+            'image_id': torch.tensor([img_id])
+        }
+        return image, target
+
+# Custom Collate Function for Detection (Simplified)
+# For detection, targets often have variable lengths, so a custom collate_fn is needed.
+# This is a very basic collate function. For actual training, you would need
+# to implement anchor matching, target encoding, etc.
+def detection_collate_fn(batch):
+    images = []
+    targets = []
+    for img, target in batch:
+        images.append(img)
+        targets.append(target) # List of dicts
+
+    # Stack images into a single tensor
+    images = torch.stack(images, 0)
+
+    # Return images and a list of target dictionaries.
+    return images, targets
+
+
+
+import copy
+from collections import deque
+import random
+import torch
+# Forgetting Mitigation Toolbox (配置)
+USE_LWF = False                     # Learning without Forgetting
+USE_REPLAY_BUFFER = True
+REPLAY_BUFFER_SIZE_PER_TASK = 20 * BATCH_SIZE  # Replay buffer 最大容量
+REPLAY_SAMPLES_PER_BATCH = 20     # 每次從 replay buffer 中抽樣的數量
+DETECTION_OUTPUT_CHANNELS = 5 + NUM_DET_CLASSES
+def decode_yolo_predictions1(pred_tensor, conf_thresh=0.5, image_size=512):
+    """
+    pred_tensor: (B, C, H, W) – raw output from detection head
+    Returns: List[Dict] with keys: boxes, scores, labels
+    """
+    B, C, H, W = pred_tensor.shape
+    num_classes = C - 5  # assuming: [cx, cy, w, h, conf, cls1, cls2,...]
+    pred_tensor = pred_tensor.permute(0, 2, 3, 1).contiguous()  # (B, H, W, C)
+
+    results = []
+    for b in range(B):
+        pred = pred_tensor[b].reshape(-1, C)  # (H*W, C)
+        cxcywh = pred[:, :4]
+        conf = pred[:, 4]
+        cls_scores = pred[:, 5:]
+
+        cls_scores = cls_scores.sigmoid()
+
+        scores, labels = cls_scores.max(dim=1)
+        scores = scores * conf  # final score
+
+        keep = scores > conf_thresh
+        if keep.sum() == 0:
+            results.append({"boxes": torch.empty((0, 4)), "scores": torch.tensor([]), "labels": torch.tensor([], dtype=torch.int64)})
+            continue
+
+        cxcywh = cxcywh[keep]
+        scores = scores[keep]
+        labels = labels[keep]
+        # 回推回到圖像空間 (grid_xy + cxcy 相對位置)
+        grid_size = image_size / H
+        grid_x = torch.arange(W).repeat(H, 1).reshape(-1).to(pred_tensor.device)
+        grid_y = torch.arange(H).unsqueeze(1).repeat(1, W).reshape(-1).to(pred_tensor.device)
+        grid_x = grid_x[keep]
+        grid_y = grid_y[keep]
+        cx = (grid_x + cxcywh[:, 0]) * grid_size
+        cy = (grid_y + cxcywh[:, 1]) * grid_size
+        w = cxcywh[:, 2] * image_size
+        h = cxcywh[:, 3] * image_size
+        x1 = cx - w / 2
+        y1 = cy - h / 2
+        x2 = cx + w / 2
+        y2 = cy + h / 2
+        boxes = torch.stack([x1, y1, x2, y2], dim=1)
+        # cxcywh → xyxy
+        #boxes = cxcywh.clone()
+        #boxes[:, 0] = cxcywh[:, 0] - cxcywh[:, 2] / 2  # x1
+        #boxes[:, 1] = cxcywh[:, 1] - cxcywh[:, 3] / 2  # y1
+        #boxes[:, 2] = cxcywh[:, 0] + cxcywh[:, 2] / 2  # x2
+        #boxes[:, 3] = cxcywh[:, 1] + cxcywh[:, 3] / 2  # y2
+
+        results.append({
+            "boxes": boxes.detach().cpu(),
+            "scores": scores.detach().cpu(),
+            "labels": labels.detach().cpu()
+        })
+    return results
+def decode_yolo_predictions(pred_tensor, conf_thresh=0.5, image_size=512):
+    """
+    Decode YOLO-style output into boxes, scores, and labels.
+    pred_tensor: (B, C, H, W) – raw output from detection head
+    Returns: List[Dict] – each dict has 'boxes', 'scores', 'labels'
+    """
+    B, C, H, W = pred_tensor.shape
+    num_classes = C - 5
+    pred_tensor = pred_tensor.permute(0, 2, 3, 1).contiguous()  # (B, H, W, C)
+    results = []
+
+    for b in range(B):
+        pred = pred_tensor[b].reshape(-1, C)  # (H*W, C)
+        cxcywh = pred[:, :4]
+        conf = torch.sigmoid(pred[:, 4])
+        cls_scores = torch.sigmoid(pred[:, 5:])
+
+        # class confidence * objectness
+        scores, labels = cls_scores.max(dim=1)
+        scores = scores * conf
+
+        # Filter by confidence threshold
+        keep = scores > conf_thresh
+        if keep.sum() == 0:
+            results.append({
+                "boxes": torch.empty((0, 4)),
+                "scores": torch.tensor([]),
+                "labels": torch.tensor([], dtype=torch.int64)
+            })
+            continue
+
+        cxcywh = cxcywh[keep]
+        scores = scores[keep]
+        labels = labels[keep]
+
+        # Decode to pixel space (cx, cy are relative to cell, so sigmoid)
+        cx_rel = torch.sigmoid(cxcywh[:, 0])
+        cy_rel = torch.sigmoid(cxcywh[:, 1])
+        w = cxcywh[:, 2] * image_size
+        h = cxcywh[:, 3] * image_size
+
+        grid_size = image_size / H
+        grid_x = torch.arange(W).repeat(H, 1).reshape(-1).to(pred_tensor.device)[keep]
+        grid_y = torch.arange(H).unsqueeze(1).repeat(1, W).reshape(-1).to(pred_tensor.device)[keep]
+
+        cx = (grid_x + cx_rel) * grid_size
+        cy = (grid_y + cy_rel) * grid_size
+
+        x1 = cx - w / 2
+        y1 = cy - h / 2
+        x2 = cx + w / 2
+        y2 = cy + h / 2
+        boxes = torch.stack([x1, y1, x2, y2], dim=1)
+
+        results.append({
+            "boxes": boxes.detach().cpu(),
+            "scores": scores.detach().cpu(),
+            "labels": labels.detach().cpu()
+        })
+
+    return results
+
+class ReplayBuffer:
+    def __init__(self, capacity_per_task):
+        self.buffer = {
+            "seg": deque(maxlen=capacity_per_task),
+            "det": deque(maxlen=capacity_per_task),
+            "cls": deque(maxlen=capacity_per_task)
+        }
+        self.capacity_per_task = capacity_per_task
+
+    def add(self, task_name, data):
+        if task_name not in self.buffer:
+            raise ValueError(f"Unknown task_name: {task_name}")
+        img, tgt = data
+
+        if isinstance(img, torch.Tensor):
+            img = img.cpu().detach()
+        if isinstance(tgt, torch.Tensor):
+            tgt = tgt.cpu().detach()
+        elif isinstance(tgt, list):
+       
+            new_list = []
+            for ann in tgt:
+                new_ann = {}
+                for k, v in ann.items():
+                    new_ann[k] = v.cpu().detach() if isinstance(v, torch.Tensor) else v
+                new_list.append(new_ann)
+            tgt = new_list
+        self.buffer[task_name].append((img, tgt))
+
+    def sample(self, task_name, num_samples):
+        if task_name not in self.buffer or len(self.buffer[task_name]) == 0:
+            return [], []
+        num = min(num_samples, len(self.buffer[task_name]))
+        samples = random.sample(self.buffer[task_name], num)
+        imgs, tgts = zip(*samples)
+        return list(imgs), list(tgts)
+
+# 4. 損失函式定義
+def build_yolo_targets(targets, S, num_classes, image_size):
+    """
+    targets: List[Dict] with keys 'boxes', 'labels'. box: [x1, y1, x2, y2] in pixels
+    Returns: Tensor (B, S, S, 5 + num_classes)
+    """
+    B = len(targets)
+    C = 5 + num_classes
+    target_tensor = torch.zeros((B, C, S, S))  # [x, y, w, h, conf, cls...]
+    cell_size = image_size / S
+
+    for b, ann in enumerate(targets):
+        boxes = ann['boxes']  # (N, 4)
+        labels = ann['labels']  # (N,)
+        for i in range(boxes.shape[0]):
+            x1, y1, x2, y2 = boxes[i]
+            cx = (x1 + x2) / 2
+            cy = (y1 + y2) / 2
+            w = x2 - x1
+            h = y2 - y1
+            grid_x = int(cx // cell_size)
+            grid_y = int(cy // cell_size)
+            if 0 <= grid_x < S and 0 <= grid_y < S:
+                rel_cx = (cx % cell_size) / cell_size
+                rel_cy = (cy % cell_size) / cell_size
+                norm_w = w / image_size
+                norm_h = h / image_size
+                class_id = labels[i].item()
+                if class_id < num_classes:
+                    target_tensor[b, 0:4, grid_y, grid_x] = torch.tensor([rel_cx, rel_cy, norm_w, norm_h])
+                    target_tensor[b, 4, grid_y, grid_x] = 1.0
+                    target_tensor[b, 5 + class_id, grid_y, grid_x] = 1.0
+                else:
+                    print(f"[Warn] class id {class_id} >= num_classes={num_classes}")
+            #cx = ((x1 + x2) / 2) / cell_size
+            #cy = ((y1 + y2) / 2) / cell_size
+            #w = (x2 - x1) / image_size
+            #h = (y2 - y1) / image_size
+            #grid_x = int(cx)
+            #grid_y = int(cy)
+            #if grid_x < S and grid_y < S and labels[i] < num_classes:
+             # target_tensor[b, 0:4, grid_y, grid_x] = torch.tensor([cx % 1, cy % 1, w, h])
+              #target_tensor[b, 4, grid_y, grid_x] = 1.0
+              #target_tensor[b, 5 + labels[i], grid_y, grid_x] = 1.0
+
+
+    return target_tensor
+
+
+class YOLOLoss(nn.Module):
+    def __init__(self, lambda_coord=5.0, lambda_noobj=0.5):
+        super().__init__()
+        self.mse = nn.MSELoss()
+        self.bce = nn.BCEWithLogitsLoss()
+        self.lambda_coord = lambda_coord
+        self.lambda_noobj = lambda_noobj
+
+    def forward(self, preds, targets):
+        # preds: (B, C, S, S) -> (B, S, S, C)
+        preds = preds.permute(0, 2, 3, 1)
+        targets = targets.permute(0, 2, 3, 1)
+        obj_mask = targets[..., 4] > 0
+        noobj_mask = ~obj_mask
+
+        # Localization loss (x, y, w, h)
+        coord_loss = self.mse(preds[obj_mask][..., 0:2], targets[obj_mask][..., 0:2])
+        size_loss = self.mse(preds[obj_mask][..., 2:4], targets[obj_mask][..., 2:4])
+
+        # Confidence loss
+        conf_loss_obj = self.bce(preds[obj_mask][..., 4], targets[obj_mask][..., 4])
+        conf_loss_noobj = self.bce(preds[noobj_mask][..., 4], targets[noobj_mask][..., 4])
+
+        # Class prediction loss
+        cls_loss = self.bce(preds[obj_mask][..., 5:], targets[obj_mask][..., 5:])
+        #cls_loss = ce(preds[obj_mask][..., 5:], labels[obj_mask])
+
+        total_loss = (
+            self.lambda_coord * coord_loss +
+            self.lambda_coord * size_loss +
+            conf_loss_obj +
+            self.lambda_noobj * conf_loss_noobj +
+            cls_loss
+        )
+        return total_loss
+
+
+seg_criterion = nn.CrossEntropyLoss(ignore_index=255)
+cls_criterion = nn.CrossEntropyLoss()
+YOLO_S = IMAGE_SIZE[0] // 16
+YOLO_LOSS = YOLOLoss()
+
+# 修改 det_criterion 使用 YOLOLoss
+
+def det_criterion(preds, targets):
+    return YOLO_LOSS(preds, targets)
+#det_criterion = YOLOLoss(S= IMAGE_SIZE[0]//16, num_classes=NUM_DET_CLASSES)
+#def det_criterion(preds, targets):
+    # preds: (B, DET_OUTPUT_CHANNELS, H, W)
+    # targets: 不用，直接返回 0
+ #   return preds.sum() * 0.0
+# --- YOLO-style Loss Function (Simplified) ---
+
+
+from torchmetrics import JaccardIndex
+
+def evaluate_seg_miou(model, dataloader, device):
+    # 忽略 label 255（VOC 的 ignore index）
+    metric = JaccardIndex(task="multiclass",num_classes=NUM_SEG_CLASSES, ignore_index=255).to(device)
+    model.eval()
+    with torch.no_grad():
+        for images, masks in tqdm(dataloader, desc="Segmentation Eval"):
+            images = images.to(device)
+            masks  = masks.to(device)
+            # forward
+            out = model(images)["segmentation"]
+            # upsample 回原始大小
+            out = F.interpolate(out, size=IMAGE_SIZE, mode='bilinear', align_corners=True)
+            # 取最高分的 class
+            preds = out.argmax(dim=1)
+            # 更新 metric
+            metric.update(preds, masks)
+    miou = metric.compute().item()
+    return miou
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+def visualize_prediction(img_tensor, pred, target, title='Detection'):
+    img = img_tensor.permute(1, 2, 0).cpu().numpy()
+    fig, ax = plt.subplots(1, figsize=(7,7))
+    ax.imshow(img)
+
+    # 預測：紅框
+    for box in pred['boxes']:
+        x1, y1, x2, y2 = box
+        rect = patches.Rectangle((x1, y1), x2-x1, y2-y1, linewidth=2, edgecolor='r', facecolor='none')
+        ax.add_patch(rect)
+
+    # 標註：綠框
+    for box in target['boxes']:
+        x1, y1, x2, y2 = box
+        rect = patches.Rectangle((x1, y1), x2-x1, y2-y1, linewidth=2, edgecolor='g', facecolor='none', linestyle='--')
+        ax.add_patch(rect)
+
+    plt.title(title)
+    plt.axis('off')
+    plt.show()
+stage1_mious = []
+stage2_mious = []
+stage2_maps = []
+stage3_mious = []
+stage3_maps = []
+stage3_accs = []
+
+def plot_training_curves():
+    fig, axes = plt.subplots(3, 1, figsize=(8, 12))
+
+    # mIoU 曲線
+    axes[0].plot(stage1_mious, label="Stage1: mIoU", marker='o')
+    axes[0].plot([None]*len(stage1_mious) + stage2_mious, label="Stage2: mIoU", marker='o')
+    axes[0].plot([None]*(len(stage1_mious)+len(stage2_mious)) + stage3_mious, label="Stage3: mIoU", marker='o')
+    axes[0].set_title("Segmentation mIoU")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("mIoU")
+    axes[0].legend()
+    axes[0].grid(True)
+
+    # mAP@50 曲線
+    total_offset = len(stage1_mious)
+    axes[1].plot([None]*total_offset + stage2_maps, label="Stage2: mAP@50", marker='o')
+    axes[1].plot([None]*(total_offset + len(stage2_maps)) + stage3_maps, label="Stage3: mAP@50", marker='o')
+    axes[1].set_title("Detection mAP@50")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("mAP@50")
+    axes[1].legend()
+    axes[1].grid(True)
+
+    # Top-1 Accuracy 曲線
+    axes[2].plot(stage3_accs, label="Stage3: Top-1 Acc", marker='o')
+    axes[2].set_title("Classification Top-1 Accuracy")
+    axes[2].set_xlabel("Epoch")
+    axes[2].set_ylabel("Accuracy")
+    axes[2].legend()
+    axes[2].grid(True)
+
+    plt.tight_layout()
+    plt.show()
+# 5. 評估函式
+from torchmetrics.detection.mean_ap import MeanAveragePrecision
+
+def evaluate_metrics(model, seg_loader=None, det_loader=None, cls_loader=None, device=DEVICE, stage_name="", verbose=True):
+    model.eval()
+    seg_miou = 0.0
+    det_map50 = 0.0
+    cls_acc = 0.0
+
+    # 1) Segmentation mIoU (略)—假設你已經有 evaluate_seg_miou()
+    if seg_loader:
+        seg_miou = evaluate_seg_miou(model, seg_loader, device)
+        if verbose: print(f"{stage_name} Segmentation mIoU: {seg_miou:.4f}")
+
+    # 2) Detection mAP@50
+    if det_loader:
+        metric = MeanAveragePrecision(iou_type='bbox', iou_thresholds=[0.5])
+        with torch.no_grad():
+            for imgs, targets in tqdm(det_loader, desc=f"{stage_name} Det Eval"):
+                imgs = imgs.to(device)
+                raw_output = model(imgs)["detection"]
+                preds = decode_yolo_predictions(raw_output, conf_thresh=0.1, image_size=512)
+                metric.update(preds, targets)
+
+                #preds = model(imgs)["detection"]
+                # preds: List[dict] with keys boxes,scores,labels already on CPU
+                #metric.update(preds, targets)
+        res = metric.compute()
+        imgs, targets = next(iter(det_loader))
+        #model.eval()
+        #with torch.no_grad():
+         # outputs = model(imgs.to(DEVICE))["detection"]
+         # preds = decode_yolo_predictions(outputs, conf_thresh=0.1)
+          #visualize_prediction(imgs[0], preds[0], targets[0])
+        det_map50 = res["map_50"].item()  # mAP@0.5
+        if verbose: print(f"{stage_name} Detection mAP@50: {det_map50:.4f}")
+
+    # 3) Classification Top-1
+    if cls_loader:
+        correct, total = 0, 0
+        with torch.no_grad():
+            for imgs, labels in cls_loader:
+                imgs, labels = imgs.to(device), labels.to(device)
+                logits = model(imgs)["classification"]
+                preds = logits.argmax(dim=1)
+                correct += (preds == labels).sum().item()
+                total += labels.size(0)
+        cls_acc = correct / total
+        if verbose: print(f"{stage_name} Classification Top-1 Acc: {cls_acc:.4f}")
+
+    return seg_miou, det_map50, cls_acc
+
+
+# 6. 三階段訓練主函式
+# 4. 建立 DataLoader
+# -----------------------------------------------------------------------------
+# Stage1 用的 Segmentation
+seg_train_dataset = VOCSegmentationDataset(VOC_TRAIN_DIR, transform=common_transforms, target_size=IMAGE_SIZE)
+seg_val_dataset   = VOCSegmentationDataset(VOC_VAL_DIR,   transform=common_transforms, target_size=IMAGE_SIZE)
+seg_train_loader  = DataLoader(seg_train_dataset, batch_size=BATCH_SIZE, shuffle=True,  num_workers=2, pin_memory=True)
+seg_val_loader    = DataLoader(seg_val_dataset,   batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+
+# Stage2 用的 Detection
+det_train_dataset = COCODetectionDataset(COCO_TRAIN_DIR, COCO_TRAIN_ANN,
+                      transform=common_transforms,
+                      target_size=IMAGE_SIZE)
+                      #num_classes=NUM_DET_CLASSES)
+
+det_val_dataset   = COCODetectionDataset(COCO_VAL_DIR,   COCO_VAL_ANN,
+                                         transform=common_transforms, target_size=IMAGE_SIZE)
+det_train_loader  = DataLoader(det_train_dataset, batch_size=BATCH_SIZE, shuffle=True,  num_workers=2,
+                               pin_memory=True, collate_fn=detection_collate_fn)
+det_val_loader    = DataLoader(det_val_dataset,   batch_size=BATCH_SIZE, shuffle=False, num_workers=2,
+                               pin_memory=True, collate_fn=detection_collate_fn)
+
+# Stage3 用的 Classification
+cls_train_dataset = ImagenetteDataset(IMAGENETTE_TRAIN_DIR, transform=common_transforms, target_size=IMAGE_SIZE)
+cls_val_dataset   = ImagenetteDataset(IMAGENETTE_VAL_DIR,   transform=common_transforms, target_size=IMAGE_SIZE)
+cls_train_loader  = DataLoader(cls_train_dataset, batch_size=BATCH_SIZE, shuffle=True,  num_workers=2, pin_memory=True)
+cls_val_loader    = DataLoader(cls_val_dataset,   batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+import time
+
+def measure_inference_speed(model, image_size, device, num_warmup=10, num_runs=10):
+    """
+    测量模型在单张 image_size 大小影像上的推论平均耗时（ms）。
+    """
+    model.eval()
+    # 准备一个随机输入
+    dummy = torch.randn(1, 3, *image_size).to(device)
+    # Warm-up
+    with torch.no_grad():
+        for _ in range(num_warmup):
+            _ = model(dummy)
+    # 计时
+    torch.cuda.synchronize() if device.type == 'cuda' else None
+    start = time.time()
+    with torch.no_grad():
+        for _ in range(num_runs):
+            _ = model(dummy)
+    torch.cuda.synchronize() if device.type == 'cuda' else None
+    elapsed = (time.time() - start) / num_runs * 1000  # 转成 ms
+    print(f"Average inference time: {elapsed:.2f} ms per image")
+    return elapsed
+
+def train_model():
+    model = UnifiedMultiTaskModel().to(DEVICE)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+
+    # （可選）準備 LwF：保存一份「老師模型」
+    if USE_LWF:
+        teacher = copy.deepcopy(model).eval()
+        kd_loss = nn.KLDivLoss(reduction='batchmean')
+        T = 2.0
+
+    # replay buffer
+    replay_buffer = ReplayBuffer(REPLAY_BUFFER_SIZE_PER_TASK)
+  
+
+    ### Stage 1: Semantic Segmentation ###
+    best_miou = -1
+    for epoch in range(NUM_EPOCHS_STAGE1):
+        model.train()
+        for imgs, masks in tqdm(seg_train_loader, desc=f"Stage1 Ep{epoch+1}"):
+            imgs, masks = imgs.to(DEVICE), masks.to(DEVICE)
+            optimizer.zero_grad()
+            seg_out = model(imgs)["segmentation"]
+            seg_up = F.interpolate(seg_out, size=IMAGE_SIZE, mode='bilinear', align_corners=True)
+            loss = seg_criterion(seg_up, masks)
+            # LwF: teacher logits distillation on segmentation head
+            if USE_LWF:
+                with torch.no_grad():
+                    tgt_logits = teacher(imgs)["segmentation"]
+                loss += kd_loss(F.log_softmax(seg_out/T,1), F.softmax(tgt_logits/T,1)) * (T*T)
+            # Replay:
+            if USE_REPLAY_BUFFER:
+                re_imgs, re_masks = replay_buffer.sample("seg", REPLAY_SAMPLES_PER_BATCH)
+                if re_imgs:
+                    re_imgs = torch.stack(re_imgs).to(DEVICE)
+                    re_masks = torch.stack(re_masks).to(DEVICE)
+                    re_out = model(re_imgs)["segmentation"]
+                    re_up = F.interpolate(re_out, size=IMAGE_SIZE, mode='bilinear', align_corners=True)
+                    loss += seg_criterion(re_up, re_masks)
+            loss.backward(); optimizer.step()
+
+            # add to replay
+            if USE_REPLAY_BUFFER:
+                for i in range(imgs.size(0)):
+                    replay_buffer.add("seg", (imgs[i].cpu(), masks[i].cpu()))
+
+        miou,_,_ = evaluate_metrics(model, seg_val_loader, None, None, DEVICE, "Stage1 Eval")
+        stage1_mious.append(miou)
+        measure_inference_speed(model, IMAGE_SIZE, DEVICE)
+        if miou > best_miou:
+            best_miou=miou; torch.save(model.state_dict(),"best_stage1.pth")
+    print("Stage1 best mIoU:", best_miou)
+
+    ### Stage 2: Object Detection ###
+    model.load_state_dict(torch.load("best_stage1.pth"))
+    best_map=-1
+    for epoch in range(NUM_EPOCHS_STAGE2):
+        model.train()
+  
+
+        for imgs, targets in tqdm(det_train_loader, desc=f"Stage2 Ep{epoch+1}"):
+            imgs = imgs.to(DEVICE)
+            optimizer.zero_grad()
+            det_out = model(imgs)["detection"]
+            # build_yolo_targets() -> targets_tensor on DEVICE
+            tgt = build_yolo_targets(targets, S=det_out.shape[-1], num_classes=NUM_DET_CLASSES, image_size=IMAGE_SIZE[0]).to(DEVICE)
+            loss = det_criterion(det_out, tgt)
+            # LwF on detection head
+            if USE_LWF:
+                with torch.no_grad():
+                    t_out = teacher(imgs)["detection"]
+                loss += kd_loss(F.log_softmax(det_out/T,1), F.softmax(t_out/T,1))*(T*T)
+            # Replay seg
+            seg_replay_weight = 2.0
+            if USE_REPLAY_BUFFER:
+                re_imgs, re_masks = replay_buffer.sample("seg", REPLAY_SAMPLES_PER_BATCH)
+                if re_imgs:
+                    re_imgs = torch.stack(re_imgs).to(DEVICE)
+                    re_masks = torch.stack(re_masks).to(DEVICE)
+                    re_seg = model(re_imgs)["segmentation"]
+                    re_up = F.interpolate(re_seg, size=IMAGE_SIZE, mode='bilinear', align_corners=True)
+                    loss += seg_replay_weight * seg_criterion(re_up, re_masks)
+            loss.backward(); optimizer.step()
+            if USE_REPLAY_BUFFER:
+                for i in range(imgs.size(0)):
+                    replay_buffer.add("det", (imgs[i].cpu(), targets[i]))
+
+
+        miou,map50,_ = evaluate_metrics(model, None, det_val_loader, None, DEVICE, "Stage2 Eval")
+        stage2_mious.append(miou)
+        stage2_maps.append(map50)
+        if map50>best_map:
+            best_map=map50; torch.save(model.state_dict(),"best_stage2.pth")
+    print("Stage2 best mAP@50:", best_map)
+
+    ### Stage 3: Image Classification ###
+    model.load_state_dict(torch.load("best_stage2.pth"))
+    best_acc=0
+    for epoch in range(NUM_EPOCHS_STAGE3):
+        model.train()
+        for imgs, labels in tqdm(cls_train_loader, desc=f"Stage3 Ep{epoch+1}"):
+            imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+            optimizer.zero_grad()
+            cls_out = model(imgs)["classification"]
+            loss = cls_criterion(cls_out, labels)
+            # LwF on cls head
+            if USE_LWF:
+                with torch.no_grad():
+                    t_cls = teacher(imgs)["classification"]
+                loss += kd_loss(F.log_softmax(cls_out/T,1), F.softmax(t_cls/T,1))*(T*T)
+            # Replay seg+det
+            if USE_REPLAY_BUFFER:
+                # replay seg
+                re_imgs, re_masks = replay_buffer.sample("seg", REPLAY_SAMPLES_PER_BATCH)
+                if re_imgs:
+                    re_imgs = torch.stack(re_imgs).to(DEVICE)
+                    re_masks = torch.stack(re_masks).to(DEVICE)
+                    re_seg = model(re_imgs)["segmentation"]
+                    re_up = F.interpolate(re_seg, size=IMAGE_SIZE, mode='bilinear', align_corners=True)
+                    loss += seg_criterion(re_up, re_masks)
+                # replay det
+                re_imgs, re_tgts = replay_buffer.sample("det", REPLAY_SAMPLES_PER_BATCH)
+                if re_imgs:
+                    re_imgs = torch.stack(re_imgs).to(DEVICE)
+                    flat = [x for sub in re_tgts for x in sub]
+                    re_det = model(re_imgs)["detection"]
+                    tgt = build_yolo_targets(re_tgts, S=re_det.shape[-1], num_classes=NUM_DET_CLASSES, image_size=IMAGE_SIZE[0]).to(DEVICE)
+                    loss += det_criterion(re_det, tgt)
+                    # simple zero loss placeholder
+                    #loss += det_criterion(re_det, build_yolo_targets(flat, S=re_det.shape[-1], num_classes=NUM_DET_CLASSES, image_size=IMAGE_SIZE[0]).to(DEVICE))
+            loss.backward(); optimizer.step()
+            if USE_REPLAY_BUFFER:
+                for i in range(imgs.size(0)):
+                    replay_buffer.add("cls", (imgs[i].cpu(), labels[i].cpu()))
+
+        miou,map50,acc = evaluate_metrics(model, None, None, cls_val_loader, DEVICE, "Stage3 Eval")
+        stage3_mious.append(miou)
+        stage3_maps.append(map50)
+        stage3_accs.append(acc)
+        if acc>best_acc:
+            best_acc=acc; torch.save(model.state_dict(),"best_stage3.pth")
+    print("Stage3 best Top1 Acc:", best_acc)
+
+    # 最終評估 + 推論速度
+    model.load_state_dict(torch.load("best_stage3.pth"))
+    seg_miou, det_map50, cls_acc = evaluate_metrics(model,
+        seg_val_loader, det_val_loader, cls_val_loader, DEVICE, "Final Eval")
+    print(f"→ Final Seg mIoU: {seg_miou:.4f}, Det mAP@50: {det_map50:.4f}, Cls Acc: {cls_acc:.4f}")
+    print("✔ 最終模型評估（計算是否低於 base - 5%）")
+    # 用前面記錄的 best 指標當 baseline
+    miou_drop = best_miou - seg_miou
+    map_drop = best_map - det_map50
+    acc_drop = best_acc - cls_acc
+
+    def check_pass(metric_name, base, final):
+        delta = base * 0.05
+        passed = final >= base - delta
+        print(f"{metric_name}: baseline={base:.4f}, final={final:.4f}, drop={base - final:.4f} → {'✅ PASS' if passed else '❌ FAIL'}")
+        return passed
+
+    ok_miou = check_pass("Seg mIoU", best_miou, seg_miou)
+    ok_map  = check_pass("Det mAP@50", best_map, det_map50)
+    ok_acc  = check_pass("Cls Top1 Acc", best_acc, cls_acc)
+
+    if ok_miou and ok_map and ok_acc:
+        print("所有任務性能下降皆在 5% 以內，符合需求！")
+    else:
+        print("有任務性能下降超過 5%，請檢查訓練流程與模型設計。")
+    
+
+
+
+if __name__ == '__main__':
+    #... 檢查資料夾 ...
+    train_model()
+    plot_training_curves()
