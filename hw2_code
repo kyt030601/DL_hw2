@@ -313,89 +313,7 @@ class VOCSegmentationDataset(Dataset):
         return image, mask
 
 
-class COCODetectionDataset1(Dataset):
-    def __init__(self, root_dir, annotation_file, transform=None, target_size=(512, 512), num_classes=10):
 
-        self.root_dir = Path(root_dir)
-        self.annotation_file = annotation_file
-        self.transform = transform if transform else transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        self.target_size = target_size
-        self.num_classes = num_classes
-
-        with open(annotation_file, 'r') as f:
-            self.coco = json.load(f)
-
-        self.image_ids = [img['id'] for img in self.coco['images']]
-        self.images_info = {img['id']: img for img in self.coco['images']}
-
-        # 保留前 num_classes 個類別
-        coco_categories = sorted({ann['category_id'] for ann in self.coco['annotations']})
-        selected_categories = coco_categories[:self.num_classes]
-        self.cat_id_to_class_idx = {cat_id: i for i, cat_id in enumerate(selected_categories)}
-
-        # Group annotations by image_id
-        self.img_to_annotations = {}
-        for ann in self.coco['annotations']:
-            image_id = ann['image_id']
-            if ann['category_id'] not in self.cat_id_to_class_idx:
-                continue  # 忽略非前 num_classes 類別
-            if image_id not in self.img_to_annotations:
-                self.img_to_annotations[image_id] = []
-            self.img_to_annotations[image_id].append(ann)
-
-    def __len__(self):
-        return len(self.image_ids)
-
-    def __getitem__(self, idx):
-        img_id = self.image_ids[idx]
-        img_info = self.images_info[img_id]
-        img_path = self.root_dir / img_info['file_name']
-        image = Image.open(img_path).convert("RGB")
-        original_width, original_height = image.size
-        image, _ = resize_image_mask(image, size=self.target_size)
-
-        if self.transform:
-            image = self.transform(image)
-
-        anns = self.img_to_annotations.get(img_id, [])
-        boxes, labels = [], []
-
-        scale_x = self.target_size[0] / original_width
-        scale_y = self.target_size[1] / original_height
-
-        for ann in anns:
-            cat_id = ann['category_id']
-            if cat_id not in self.cat_id_to_class_idx:
-                continue
-            label = self.cat_id_to_class_idx[cat_id]
-
-            x, y, w, h = ann['bbox']
-
-            #x_scaled = x * scale_x
-            #y_scaled = y * scale_y
-            #w_scaled = w * scale_x
-            #h_scaled = h * scale_y
-            x1 = x * scale_x
-            y1 = y * scale_y
-            x2 = (x + w) * scale_x
-            y2 = (y + h) * scale_y
-
-            boxes.append([x1, y1, x2, y2])
-            #boxes.append([x_scaled, y_scaled, w_scaled, h_scaled])
-            labels.append(label)
-
-        if not boxes:
-            boxes = torch.zeros((0, 4), dtype=torch.float32)
-            labels = torch.zeros((0,), dtype=torch.long)
-        else:
-            boxes = torch.tensor(boxes, dtype=torch.float32)
-            labels = torch.tensor(labels, dtype=torch.long)
-
-        target = {'boxes': boxes, 'labels': labels, 'image_id': torch.tensor([img_id])}
-        return image, target
 
 class COCODetectionDataset(Dataset):
     def __init__(self, root_dir, annotation_file, transform=None, target_size=(512, 512), num_classes=10):
@@ -479,10 +397,7 @@ class COCODetectionDataset(Dataset):
         }
         return image, target
 
-# Custom Collate Function for Detection (Simplified)
-# For detection, targets often have variable lengths, so a custom collate_fn is needed.
-# This is a very basic collate function. For actual training, you would need
-# to implement anchor matching, target encoding, etc.
+
 def detection_collate_fn(batch):
     images = []
     targets = []
